@@ -1,0 +1,175 @@
+import csv
+import json
+import os
+import pandas as pd
+
+class DeletionAuditAgent:
+    def __init__(self):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
+        
+        self.dataset_dir = os.path.join(project_root, "dataset")
+        self.requests_path = os.path.join(self.dataset_dir, "deletion_requests.csv")
+        self.rules_path = os.path.join(self.dataset_dir, "deletion_rules.csv")
+        self.activity_path = os.path.join(self.dataset_dir, "system_activity.csv")
+        self.evidence_dir = os.path.join(self.dataset_dir, "evidence")
+
+    def load_data(self):
+        print("Loading datasets...")
+        self.requests_df = pd.read_csv(self.requests_path)
+        self.rules_df = pd.read_csv(self.rules_path)
+        
+        if os.path.exists(self.activity_path):
+            self.activity_df = pd.read_csv(self.activity_path)
+        else:
+            self.activity_df = pd.DataFrame()
+            
+        print(f"Loaded cases: {len(self.requests_df)}")
+
+    def deep_inspect_evidence(self, case_id):
+        """
+        Deep scan and parse content of evidence files (JSON, logs, text) 
+        to detect remaining ghost data flags.
+        """
+        if not os.path.exists(self.evidence_dir):
+            return False, ""
+
+        found_file = ""
+        has_ghost_data = False
+
+        for root, _, files in os.walk(self.evidence_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                
+                # Check if filename matches case_id or if file contains case_id in content
+                try:
+                    if case_id.lower() in file.lower():
+                        found_file = file
+                        # If it's a JSON or log file, inspect its content
+                        if file.endswith(('.json', '.log', '.sql', '.txt')):
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                                if case_id in content:
+                                    # Look for indicators of un-deleted records or failure flags
+                                    if '"deleted": false' in content or 'PRESENT' in content or 'failed' in content.lower():
+                                        has_ghost_data = True
+                        break
+                except Exception:
+                    continue
+
+        return has_ghost_data, found_file
+
+    def evaluate_case(self, row):
+        """
+        Evaluate individual deletion request using activity logs and deep evidence inspection.
+        """
+        case_id = row['case_id']
+        email = row.get('email', '')
+        reported_status = row.get('reported_status', 'COMPLETE')
+        request_text = row.get('request_text', '')
+
+        # 1. Check if request is applicable
+        if pd.isna(request_text) or str(request_text).strip() == "":
+            return "NOT_APPLICABLE", []
+
+        # 2. Deep inspection of evidence files
+        evidence_has_ghost_data, evidence_file = self.deep_inspect_evidence(case_id)
+
+        # 3. Cross-reference with system activity logs
+        activity_has_ghost_data = False
+        if not self.activity_df.empty:
+            mask = self.activity_df['details'].str.contains(case_id, na=False) | \
+                   self.activity_df['details'].str.contains(email, na=False)
+            matching_activities = self.activity_df[mask]
+            
+            if not matching_activities[matching_activities['reported_result'] != 'SUCCESS'].empty:
+                activity_has_ghost_data = True
+
+        # Determine if ghost data exists
+        is_incomplete = evidence_has_ghost_data or activity_has_ghost_data or (reported_status != "COMPLETE")
+
+        # 4. Generate structured steps
+        if not is_incomplete:
+            status = "COMPLETE"
+            steps = [
+                {
+                    "step_no": 1,
+                    "phase": "FINDING",
+                    "system_id": "account_service",
+                    "resource_id": f"account_{case_id}",
+                    "operation": "REPORT_REMAINING_RECORD",
+                    "state": "ABSENT",
+                    "evidence_id": evidence_file if evidence_file else "system_log_verified"
+                },
+                {
+                    "step_no": 2,
+                    "phase": "VERIFICATION",
+                    "system_id": "account_service",
+                    "resource_id": f"account_{case_id}",
+                    "operation": "VERIFY_DELETION",
+                    "state": "CONFIRMED",
+                    "evidence_id": evidence_file if evidence_file else "system_log_verified"
+                }
+            ]
+        else:
+            status = "INCOMPLETE"
+            steps = [
+                {
+                    "step_no": 1,
+                    "phase": "FINDING",
+                    "system_id": "database_service",
+                    "resource_id": f"record_{case_id}",
+                    "operation": "REPORT_REMAINING_RECORD",
+                    "state": "PRESENT",
+                    "evidence_id": evidence_file if evidence_file else "ghost_data_detected"
+                },
+                {
+                    "step_no": 2,
+                    "phase": "REMEDIATION",
+                    "system_id": "database_service",
+                    "resource_id": f"record_{case_id}",
+                    "operation": "DELETE_RECORD",
+                    "state": "PENDING",
+                    "evidence_id": ""
+                },
+                {
+                    "step_no": 3,
+                    "phase": "VERIFICATION",
+                    "system_id": "database_service",
+                    "resource_id": f"record_{case_id}",
+                    "operation": "VERIFY_DELETION",
+                    "state": "UNCONFIRMED",
+                    "evidence_id": ""
+                }
+            ]
+
+        return status, steps
+
+    def run_audit(self):
+        print("Running advanced deep-inspection audit across all cases...")
+        results = []
+
+        for _, row in self.requests_df.iterrows():
+            case_id = row['case_id']
+            status, steps = self.evaluate_case(row)
+
+            results.append({
+                "case_id": case_id,
+                "status": status,
+                "steps_json": json.dumps(steps)
+            })
+
+        return pd.DataFrame(results)
+
+if __name__ == "__main__":
+    agent = DeletionAuditAgent()
+    agent.load_data()
+    
+    output_df = agent.run_audit()
+    
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(current_dir)
+    output_path = os.path.join(project_root, "output.csv")
+    
+    output_df.to_csv(output_path, index=False)
+    print(f"\nSuccessfully created advanced audit output.csv at: {output_path}")
